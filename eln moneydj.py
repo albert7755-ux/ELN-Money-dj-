@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 from deep_translator import GoogleTranslator
 
 # --- 1. 基礎設定 ---
-st.set_page_config(page_title="結構型商品戰情室 (V11.0)", layout="wide")
+st.set_page_config(page_title="結構型商品戰情室 (V12.0)", layout="wide")
 
 # ==========================================
 # 🔐 密碼保護機制
@@ -40,7 +40,7 @@ if not check_password():
 # ==========================================
 
 st.title("📊 結構型商品 - 關鍵點位與長週期風險回測")
-st.markdown("回測區間：**2009/01/01 至今**。**特色：基本面透視 + 中文簡介**。")
+st.markdown("回測區間：**2009/01/01 至今**。**特色：內建中文資料庫 (防封鎖機制)**。")
 st.divider()
 
 # --- 2. 側邊欄：參數設定 ---
@@ -67,57 +67,68 @@ period_months = st.sidebar.number_input("產品/觀察天期 (月)", min_value=1
 
 run_btn = st.sidebar.button("🚀 開始分析", type="primary")
 
-# --- 3. 核心函數 ---
+# --- 3. 核心函數：內建資料庫 + 混合抓取 ---
+
+# 🔹 預先建立常用股票的中文簡介 (保底機制)
+STATIC_CN_SUMMARIES = {
+    'TSLA': '特斯拉 (Tesla) 設計、開發、製造、租賃和銷售電動車，以及能源發電和儲存系統。其汽車業務包括 Model 3、Model Y、Model S 和 Model X。此外，公司還提供太陽能板、太陽能屋頂及 Powerwall 儲能產品，致力於加速全球轉向永續能源。',
+    'NVDA': '輝達 (NVIDIA) 是全球領先的運算基礎設施公司，以發明 GPU (圖形處理器) 聞名。如今，NVIDIA 是人工智慧 (AI)、高效能運算 (HPC)、遊戲及自動駕駛汽車技術的領導者。其資料中心業務受惠於 AI 浪潮，提供強大的 H100/A100 晶片與 CUDA 軟體生態系。',
+    'GOOG': 'Alphabet (Google 母公司) 是全球科技巨頭，業務涵蓋搜尋引擎 (Google Search)、線上廣告、影音平台 (YouTube)、雲端運算 (Google Cloud)、Android 作業系統及硬體產品 (Pixel)。公司亦在 AI (Gemini)、自動駕駛 (Waymo) 等領域投入大量研發資源。',
+    'GOOGL': 'Alphabet (Google 母公司) 是全球科技巨頭，業務涵蓋搜尋引擎 (Google Search)、線上廣告、影音平台 (YouTube)、雲端運算 (Google Cloud)、Android 作業系統及硬體產品 (Pixel)。公司亦在 AI (Gemini)、自動駕駛 (Waymo) 等領域投入大量研發資源。',
+    'AAPL': '蘋果 (Apple) 設計、製造和銷售智慧型手機 (iPhone)、個人電腦 (Mac)、平板電腦 (iPad)、穿戴式裝置 (Apple Watch, AirPods) 及配件。公司亦提供各類服務，包括 App Store、Apple Music、iCloud 及 Apple Pay。以其強大的生態系與品牌忠誠度著稱。',
+    'MSFT': '微軟 (Microsoft) 是全球最大的軟體公司之一，知名產品包括 Windows 作業系統、Office 生產力軟體、Azure 雲端平台。近年來，微軟透過投資 OpenAI 及推出 Copilot，在生成式 AI 領域佔據領導地位，同時擁有 Xbox 遊戲業務及 LinkedIn 社交平台。',
+    'AMD': '超微半導體 (AMD) 是一家全球半導體公司，主要設計和製造微處理器 (CPU)、圖形處理器 (GPU) 和伺服器晶片。AMD 在 PC 與資料中心市場與 Intel 競爭，並在高效能運算與 AI 加速器領域挑戰 NVIDIA 的地位。',
+    'AMZN': '亞馬遜 (Amazon) 是全球電子商務與雲端運算 (AWS) 的領導者。除線上零售外，AWS 為企業提供基礎設施服務，是公司主要的獲利來源。亞馬遜亦涉足串流媒體 (Prime Video)、智慧居家 (Alexa) 及物流配送網絡。',
+    'META': 'Meta Platforms (前身為 Facebook) 運營全球最大的社群媒體家族，包括 Facebook、Instagram、WhatsApp 和 Messenger。公司主要營收來自數位廣告，並積極投入元宇宙 (Reality Labs) 及開源 AI 模型 (Llama) 的開發。',
+    'NFLX': '網飛 (Netflix) 是全球領先的串流媒體娛樂服務公司，提供各種語言和類型的電視影集、紀錄片和電影。公司透過會員訂閱模式營運，並投入大量資金製作原創內容 (Netflix Originals)，業務遍及全球 190 多個國家。'
+}
 
 @st.cache_data(ttl=3600)
-def get_company_fundamentals(ticker):
+def get_company_fundamentals_robust(ticker):
     """
-    抓取公司基本面數據並進行翻譯
+    雙軌制：優先用 API，失敗則用內建資料庫
     """
+    data = {
+        'eps': 'N/A', 'pe': 'N/A', 'f_eps': 'N/A', 'f_pe': 'N/A',
+        'margin': 'N/A', 'debt': 'N/A', 'desc_cn': ''
+    }
+    
+    # 1. 嘗試透過 API 抓取 (雲端可能失敗)
     try:
         stock = yf.Ticker(ticker)
         info = stock.info
         
-        # 1. 抓取數據 (若無資料顯示 N/A)
-        data = {
-            'eps': info.get('trailingEps', 'N/A'),
-            'pe': info.get('trailingPE', 'N/A'),
-            'f_eps': info.get('forwardEps', 'N/A'),
-            'f_pe': info.get('forwardPE', 'N/A'),
-            'margin': info.get('grossMargins', 'N/A'),
-            'debt': info.get('debtToEquity', 'N/A'),
-            'desc_en': info.get('longBusinessSummary', '')
-        }
-        
-        # 2. 格式化數值
-        if isinstance(data['eps'], (int, float)): data['eps'] = f"${data['eps']:.2f}"
-        if isinstance(data['pe'], (int, float)): data['pe'] = f"{data['pe']:.2f}"
-        if isinstance(data['f_eps'], (int, float)): data['f_eps'] = f"${data['f_eps']:.2f}"
-        if isinstance(data['f_pe'], (int, float)): data['f_pe'] = f"{data['f_pe']:.2f}"
-        if isinstance(data['margin'], (int, float)): data['margin'] = f"{data['margin']*100:.2f}%"
-        if isinstance(data['debt'], (int, float)): data['debt'] = f"{data['debt']:.2f}"
-        
-        # 3. 翻譯簡介 (English -> Traditional Chinese)
-        if data['desc_en']:
-            try:
-                # 限制長度以免翻譯失敗，通常前 2000 字元足夠
-                translator = GoogleTranslator(source='auto', target='zh-TW')
-                data['desc_cn'] = translator.translate(data['desc_en'][:2000])
-            except:
-                data['desc_cn'] = data['desc_en'] # 翻譯失敗則顯示英文
-        else:
-            data['desc_cn'] = "暫無公司說明資料。"
+        # 如果 API 成功，填入數據
+        if 'trailingEps' in info:
+            data['eps'] = f"${info.get('trailingEps', 0):.2f}"
+            data['pe'] = f"{info.get('trailingPE', 0):.2f}"
+            data['f_eps'] = f"${info.get('forwardEps', 0):.2f}"
+            data['f_pe'] = f"{info.get('forwardPE', 0):.2f}"
+            data['margin'] = f"{info.get('grossMargins', 0)*100:.2f}%"
+            data['debt'] = f"{info.get('debtToEquity', 0):.2f}"
             
-        return data
-    except Exception:
-        return None
+            # 翻譯簡介
+            desc_en = info.get('longBusinessSummary', '')
+            if desc_en:
+                translator = GoogleTranslator(source='auto', target='zh-TW')
+                data['desc_cn'] = translator.translate(desc_en[:1500])
+    except:
+        pass # API 失敗，安靜地進入備援方案
+
+    # 2. 備援機制：如果簡介是空的，檢查內建字典
+    if not data['desc_cn']:
+        if ticker in STATIC_CN_SUMMARIES:
+            data['desc_cn'] = STATIC_CN_SUMMARIES[ticker] + " (來源：內建資料庫)"
+            # 如果數據也是 N/A，可以給一些預設提示，或者保留 N/A (因為股價還是會準)
+        else:
+            data['desc_cn'] = "⚠️ 因雲端連線限制，暫無法取得此公司簡介。但股價回測功能仍可正常運作。"
+
+    return data
 
 def display_fundamental_info(ticker, data):
-    """
-    顯示類似 MoneyDJ 風格的表格與簡介
-    """
+    """顯示資訊"""
     st.markdown(f"""
-    <div style="background-color: #f8f9fa; padding: 15px; border-radius: 10px; border-left: 5px solid #1f77b4; margin-bottom: 20px;">
+    <div style="background-color: #f8f9fa; padding: 15px; border-radius: 10px; border-left: 5px solid #28a745; margin-bottom: 20px;">
         <h4 style="margin-top:0; color:#333;">🏢 {ticker} 基本面數據</h4>
         <table style="width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 15px;">
             <tr style="border-bottom: 1px solid #ddd;">
@@ -142,9 +153,6 @@ def display_fundamental_info(ticker, data):
             <p style="font-size: 15px; line-height: 1.6; color: #444; text-align: justify; margin-top: 5px;">
                 {data['desc_cn']}
             </p>
-        </div>
-        <div style="text-align: right; font-size: 12px; color: #888; margin-top: 5px;">
-            資料來源：Yahoo Finance (AI 自動翻譯)
         </div>
     </div>
     """, unsafe_allow_html=True)
@@ -295,20 +303,17 @@ if run_btn:
             st.markdown(f"### 📌 標的：{ticker}")
 
             # ==========================================
-            # A. 顯示基本面資訊 + 中文簡介 (取代 TradingView)
+            # A. 顯示基本面資訊 + 中文簡介 (雙重保險版)
             # ==========================================
-            with st.spinner(f"正在抓取 {ticker} 基本面與業務簡介..."):
-                fund_data = get_company_fundamentals(ticker)
-            
-            if fund_data:
+            with st.spinner(f"正在分析 {ticker} ..."):
+                # 不論成功失敗，這裡都會回傳一個字典，不會報錯
+                fund_data = get_company_fundamentals_robust(ticker)
                 display_fundamental_info(ticker, fund_data)
-            else:
-                st.warning(f"⚠️ 無法取得 {ticker} 的基本面資訊。")
             
             # ==========================================
-            # B. 執行回測
+            # B. 執行回測 (Yahoo Price Data 通常較少被擋)
             # ==========================================
-            with st.spinner(f"正在分析 {ticker} 歷史走勢 (2009-Now) ..."):
+            with st.spinner(f"正在計算歷史數據 (2009-Now) ..."):
                 df, err = get_stock_data_from_2009(ticker)
             
             if err:
@@ -331,7 +336,7 @@ if run_btn:
                 continue
 
             # ==========================================
-            # C. 四大重點指標 (價位)
+            # C. 四大重點指標
             # ==========================================
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("最新股價", f"{current_price:.2f}")
@@ -351,7 +356,7 @@ if run_btn:
             st.divider()
 
             # ==========================================
-            # E. 走勢及關鍵價位圖 (主圖)
+            # E. 走勢及關鍵價位圖
             # ==========================================
             fig_main = plot_integrated_chart(df, ticker, current_price, p_ko, p_ki, p_st)
             st.plotly_chart(fig_main, use_container_width=True)
@@ -413,6 +418,6 @@ st.markdown("""
     2. <strong>歷史不代表未來</strong>：回測數據基於 2009 年至今之歷史股價，過去的市場表現不保證未來的走勢。<br>
     3. <strong>非保本商品</strong>：結構型商品 (ELN/FCN) 為非保本型投資，最大風險為股價下跌導致本金全數虧損 (需承接價值減損之股票)。<br>
     4. <strong>實際條款為準</strong>：實際商品之觀察日、配息率、提前出場 (KO) 及敲入 (KI) 判定方式，請以發行機構之公開說明書及合約為準。<br>
-    5. <strong>資料來源</strong>：股價與基本面資料來源為 Yahoo Finance 公開數據，並經由 AI 自動翻譯，可能存在延遲、誤差或語意不精確，本系統不保證資料之即時性與正確性。
+    5. <strong>資料來源</strong>：股價資料來源為 Yahoo Finance 公開數據，並經由 AI 自動翻譯，可能存在延遲、誤差或語意不精確，本系統不保證資料之即時性與正確性。
 </div>
 """, unsafe_allow_html=True)
