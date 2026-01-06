@@ -3,18 +3,18 @@ import plotly.graph_objects as go
 import pandas as pd
 import yfinance as yf
 import numpy as np
-from datetime import datetime, timedelta
-from deep_translator import GoogleTranslator
+import requests
+from bs4 import BeautifulSoup
+import urllib.parse
+import json
 
 # --- 1. 基礎設定 ---
-st.set_page_config(page_title="結構型商品戰情室 (V12.0)", layout="wide")
+st.set_page_config(page_title="結構型商品戰情室 (V13.0)", layout="wide")
 
 # ==========================================
 # 🔐 密碼保護機制
 # ==========================================
 def check_password():
-    """Returns `True` if the user had the correct password."""
-
     def password_entered():
         if st.session_state["password"] == "5428":
             st.session_state["password_correct"] = True
@@ -27,7 +27,7 @@ def check_password():
         return False
     elif not st.session_state["password_correct"]:
         st.text_input("請輸入系統密碼 (Access Code)", type="password", on_change=password_entered, key="password")
-        st.error("❌ 密碼錯誤 (Incorrect Password)")
+        st.error("❌ 密碼錯誤")
         return False
     else:
         return True
@@ -40,384 +40,291 @@ if not check_password():
 # ==========================================
 
 st.title("📊 結構型商品 - 關鍵點位與長週期風險回測")
-st.markdown("回測區間：**2009/01/01 至今**。**特色：內建中文資料庫 (防封鎖機制)**。")
+st.markdown("回測區間：**2009/01/01 至今**。**特色：MoneyDJ/奇摩股市 強力抓取 (跳板模式)**。")
 st.divider()
 
-# --- 2. 側邊欄：參數設定 ---
+# --- 2. 側邊欄 ---
 st.sidebar.header("1️⃣ 輸入標的")
 default_tickers = "TSLA, NVDA, GOOG"
 tickers_input = st.sidebar.text_area("股票代碼 (逗號分隔)", value=default_tickers, height=80)
 
 st.sidebar.divider()
 st.sidebar.header("2️⃣ 結構條件 (%)")
-st.sidebar.info("以該期「進場價」為 100% 基準：")
-
-ko_pct = st.sidebar.number_input("KO (敲出價 %)", value=100.0, step=0.5, format="%.1f")
-strike_pct = st.sidebar.number_input("Strike (轉換/執行價 %)", value=80.0, step=1.0, format="%.1f")
-ki_pct = st.sidebar.number_input("KI (下檔保護價 %)", value=65.0, step=1.0, format="%.1f")
+ko_pct = st.sidebar.number_input("KO (敲出價 %)", value=100.0, step=0.5)
+strike_pct = st.sidebar.number_input("Strike (轉換/執行價 %)", value=80.0, step=1.0)
+ki_pct = st.sidebar.number_input("KI (下檔保護價 %)", value=65.0, step=1.0)
 
 st.sidebar.divider()
 st.sidebar.header("3️⃣ 投資與配息設定")
-principal = st.sidebar.number_input("投資本金 (例如 USD)", value=100000, step=10000, help="輸入客戶預計投資的金額")
-coupon_pa = st.sidebar.number_input("年化配息率 (Coupon %)", value=8.0, step=0.5, format="%.1f")
+principal = st.sidebar.number_input("投資本金 (例如 USD)", value=100000, step=10000)
+coupon_pa = st.sidebar.number_input("年化配息率 (Coupon %)", value=8.0, step=0.5)
 
 st.sidebar.divider()
 st.sidebar.header("4️⃣ 回測參數設定")
-period_months = st.sidebar.number_input("產品/觀察天期 (月)", min_value=1, max_value=60, value=6, step=1)
+period_months = st.sidebar.number_input("產品/觀察天期 (月)", min_value=1, max_value=60, value=6)
 
 run_btn = st.sidebar.button("🚀 開始分析", type="primary")
 
-# --- 3. 核心函數：內建資料庫 + 混合抓取 ---
-
-# 🔹 預先建立常用股票的中文簡介 (保底機制)
-STATIC_CN_SUMMARIES = {
-    'TSLA': '特斯拉 (Tesla) 設計、開發、製造、租賃和銷售電動車，以及能源發電和儲存系統。其汽車業務包括 Model 3、Model Y、Model S 和 Model X。此外，公司還提供太陽能板、太陽能屋頂及 Powerwall 儲能產品，致力於加速全球轉向永續能源。',
-    'NVDA': '輝達 (NVIDIA) 是全球領先的運算基礎設施公司，以發明 GPU (圖形處理器) 聞名。如今，NVIDIA 是人工智慧 (AI)、高效能運算 (HPC)、遊戲及自動駕駛汽車技術的領導者。其資料中心業務受惠於 AI 浪潮，提供強大的 H100/A100 晶片與 CUDA 軟體生態系。',
-    'GOOG': 'Alphabet (Google 母公司) 是全球科技巨頭，業務涵蓋搜尋引擎 (Google Search)、線上廣告、影音平台 (YouTube)、雲端運算 (Google Cloud)、Android 作業系統及硬體產品 (Pixel)。公司亦在 AI (Gemini)、自動駕駛 (Waymo) 等領域投入大量研發資源。',
-    'GOOGL': 'Alphabet (Google 母公司) 是全球科技巨頭，業務涵蓋搜尋引擎 (Google Search)、線上廣告、影音平台 (YouTube)、雲端運算 (Google Cloud)、Android 作業系統及硬體產品 (Pixel)。公司亦在 AI (Gemini)、自動駕駛 (Waymo) 等領域投入大量研發資源。',
-    'AAPL': '蘋果 (Apple) 設計、製造和銷售智慧型手機 (iPhone)、個人電腦 (Mac)、平板電腦 (iPad)、穿戴式裝置 (Apple Watch, AirPods) 及配件。公司亦提供各類服務，包括 App Store、Apple Music、iCloud 及 Apple Pay。以其強大的生態系與品牌忠誠度著稱。',
-    'MSFT': '微軟 (Microsoft) 是全球最大的軟體公司之一，知名產品包括 Windows 作業系統、Office 生產力軟體、Azure 雲端平台。近年來，微軟透過投資 OpenAI 及推出 Copilot，在生成式 AI 領域佔據領導地位，同時擁有 Xbox 遊戲業務及 LinkedIn 社交平台。',
-    'AMD': '超微半導體 (AMD) 是一家全球半導體公司，主要設計和製造微處理器 (CPU)、圖形處理器 (GPU) 和伺服器晶片。AMD 在 PC 與資料中心市場與 Intel 競爭，並在高效能運算與 AI 加速器領域挑戰 NVIDIA 的地位。',
-    'AMZN': '亞馬遜 (Amazon) 是全球電子商務與雲端運算 (AWS) 的領導者。除線上零售外，AWS 為企業提供基礎設施服務，是公司主要的獲利來源。亞馬遜亦涉足串流媒體 (Prime Video)、智慧居家 (Alexa) 及物流配送網絡。',
-    'META': 'Meta Platforms (前身為 Facebook) 運營全球最大的社群媒體家族，包括 Facebook、Instagram、WhatsApp 和 Messenger。公司主要營收來自數位廣告，並積極投入元宇宙 (Reality Labs) 及開源 AI 模型 (Llama) 的開發。',
-    'NFLX': '網飛 (Netflix) 是全球領先的串流媒體娛樂服務公司，提供各種語言和類型的電視影集、紀錄片和電影。公司透過會員訂閱模式營運，並投入大量資金製作原創內容 (Netflix Originals)，業務遍及全球 190 多個國家。'
-}
+# --- 3. 核心函數：強力爬蟲 (跳板模式) ---
 
 @st.cache_data(ttl=3600)
-def get_company_fundamentals_robust(ticker):
+def fetch_native_chinese_summary(ticker):
     """
-    雙軌制：優先用 API，失敗則用內建資料庫
+    嘗試透過 Proxy 跳板抓取 MoneyDJ 或 Yahoo奇摩股市的原始中文資料
     """
-    data = {
-        'eps': 'N/A', 'pe': 'N/A', 'f_eps': 'N/A', 'f_pe': 'N/A',
-        'margin': 'N/A', 'debt': 'N/A', 'desc_cn': ''
-    }
-    
-    # 1. 嘗試透過 API 抓取 (雲端可能失敗)
+    summary = None
+    source = None
+
+    # --- 策略 A: MoneyDJ (透過 AllOrigins 跳板) ---
+    try:
+        # MoneyDJ 美股個股頁面
+        target_url = f"https://www.moneydj.com/us/basic/basic0001/{ticker}"
+        # 使用 AllOrigins 作為跳板，繞過 IP 封鎖
+        proxy_url = f"https://api.allorigins.win/get?url={urllib.parse.quote(target_url)}"
+        
+        response = requests.get(proxy_url, timeout=10)
+        data = response.json()
+        html_content = data.get('contents', '')
+        
+        if html_content:
+            soup = BeautifulSoup(html_content, 'html.parser')
+            # MoneyDJ 的經營概述通常在特定的表格結構中，尋找關鍵字
+            # 這裡用比較寬鬆的搜尋：找含有「經營概述」文字的下一個區塊
+            all_text = soup.get_text(separator='\n')
+            lines = all_text.split('\n')
+            for i, line in enumerate(lines):
+                if "經營概述" in line and len(line) < 20: # 找到標題
+                    # 嘗試抓取接下來的幾行，通常是內容
+                    potential_content = ""
+                    for j in range(1, 10): # 往下找 10 行
+                        if i+j < len(lines):
+                            txt = lines[i+j].strip()
+                            if len(txt) > 50: # 內容通常比較長
+                                potential_content = txt
+                                break
+                    if potential_content:
+                        summary = potential_content
+                        source = "MoneyDJ 理財網 (繁體中文)"
+                        break
+    except Exception:
+        pass # 失敗就換下一招
+
+    # --- 策略 B: Yahoo 奇摩股市 (透過 AllOrigins 跳板) ---
+    if not summary:
+        try:
+            # 奇摩股市美股頁面
+            target_url = f"https://tw.stock.yahoo.com/quote/{ticker}/profile"
+            proxy_url = f"https://api.allorigins.win/get?url={urllib.parse.quote(target_url)}"
+            
+            response = requests.get(proxy_url, timeout=10)
+            data = response.json()
+            html_content = data.get('contents', '')
+            
+            if html_content:
+                soup = BeautifulSoup(html_content, 'html.parser')
+                # 奇摩股市的簡介通常在一個 class 為 "Py(12px)" 或類似的區塊中
+                # 我們找尋頁面中字數最多的段落，通常就是簡介
+                paragraphs = soup.find_all('p')
+                longest_p = ""
+                for p in paragraphs:
+                    txt = p.get_text().strip()
+                    if len(txt) > len(longest_p) and len(txt) > 50:
+                        longest_p = txt
+                
+                # 簡單過濾掉像是免責聲明之類的
+                if longest_p and "報價延遲" not in longest_p:
+                    summary = longest_p
+                    source = "Yahoo 奇摩股市 (繁體中文)"
+        except Exception:
+            pass
+
+    # --- 策略 C: 真的抓不到，回退到 yfinance 英文 (但不翻譯了，直接顯示提示) ---
+    if not summary:
+        try:
+            tk = yf.Ticker(ticker)
+            eng_summary = tk.info.get('longBusinessSummary', '')
+            if eng_summary:
+                summary = f"(暫無法取得中文資料，顯示原文)\n{eng_summary}"
+                source = "Yahoo Finance (English)"
+            else:
+                summary = "查無相關公司簡介。"
+                source = "系統"
+        except:
+            summary = "資料讀取失敗。"
+            source = "系統"
+
+    return summary, source
+
+@st.cache_data(ttl=3600)
+def get_financial_data(ticker):
+    """只抓取數字數據 (EPS, PE等)"""
     try:
         stock = yf.Ticker(ticker)
         info = stock.info
-        
-        # 如果 API 成功，填入數據
-        if 'trailingEps' in info:
-            data['eps'] = f"${info.get('trailingEps', 0):.2f}"
-            data['pe'] = f"{info.get('trailingPE', 0):.2f}"
-            data['f_eps'] = f"${info.get('forwardEps', 0):.2f}"
-            data['f_pe'] = f"{info.get('forwardPE', 0):.2f}"
-            data['margin'] = f"{info.get('grossMargins', 0)*100:.2f}%"
-            data['debt'] = f"{info.get('debtToEquity', 0):.2f}"
-            
-            # 翻譯簡介
-            desc_en = info.get('longBusinessSummary', '')
-            if desc_en:
-                translator = GoogleTranslator(source='auto', target='zh-TW')
-                data['desc_cn'] = translator.translate(desc_en[:1500])
+        data = {
+            'eps': info.get('trailingEps', 'N/A'),
+            'pe': info.get('trailingPE', 'N/A'),
+            'f_eps': info.get('forwardEps', 'N/A'),
+            'f_pe': info.get('forwardPE', 'N/A'),
+            'margin': info.get('grossMargins', 'N/A'),
+            'debt': info.get('debtToEquity', 'N/A'),
+        }
+        # 格式化
+        if isinstance(data['eps'], (int, float)): data['eps'] = f"${data['eps']:.2f}"
+        if isinstance(data['pe'], (int, float)): data['pe'] = f"{data['pe']:.2f}"
+        if isinstance(data['f_eps'], (int, float)): data['f_eps'] = f"${data['f_eps']:.2f}"
+        if isinstance(data['f_pe'], (int, float)): data['f_pe'] = f"{data['f_pe']:.2f}"
+        if isinstance(data['margin'], (int, float)): data['margin'] = f"{data['margin']*100:.2f}%"
+        if isinstance(data['debt'], (int, float)): data['debt'] = f"{data['debt']:.2f}"
+        return data
     except:
-        pass # API 失敗，安靜地進入備援方案
+        return None
 
-    # 2. 備援機制：如果簡介是空的，檢查內建字典
-    if not data['desc_cn']:
-        if ticker in STATIC_CN_SUMMARIES:
-            data['desc_cn'] = STATIC_CN_SUMMARIES[ticker] + " (來源：內建資料庫)"
-            # 如果數據也是 N/A，可以給一些預設提示，或者保留 N/A (因為股價還是會準)
-        else:
-            data['desc_cn'] = "⚠️ 因雲端連線限制，暫無法取得此公司簡介。但股價回測功能仍可正常運作。"
+def display_info_card(ticker):
+    """整合顯示"""
+    fin_data = get_financial_data(ticker)
+    desc, source = fetch_native_chinese_summary(ticker)
+    
+    if fin_data:
+        st.markdown(f"""
+        <div style="background-color: #f8f9fa; padding: 20px; border-radius: 10px; border-left: 5px solid #d93025; margin-bottom: 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
+            <h3 style="margin-top:0; color:#202124;">🏢 {ticker} 企業透視</h3>
+            
+            <div style="display: flex; flex-wrap: wrap; gap: 15px; margin-bottom: 15px; background: #fff; padding: 10px; border-radius: 8px;">
+                <div style="flex: 1; min-width: 120px;"><b>EPS:</b> {fin_data['eps']}</div>
+                <div style="flex: 1; min-width: 120px;"><b>P/E:</b> {fin_data['pe']}</div>
+                <div style="flex: 1; min-width: 120px;"><b>毛利率:</b> {fin_data['margin']}</div>
+                <div style="flex: 1; min-width: 120px;"><b>負債比:</b> {fin_data['debt']}</div>
+            </div>
 
-    return data
-
-def display_fundamental_info(ticker, data):
-    """顯示資訊"""
-    st.markdown(f"""
-    <div style="background-color: #f8f9fa; padding: 15px; border-radius: 10px; border-left: 5px solid #28a745; margin-bottom: 20px;">
-        <h4 style="margin-top:0; color:#333;">🏢 {ticker} 基本面數據</h4>
-        <table style="width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 15px;">
-            <tr style="border-bottom: 1px solid #ddd;">
-                <td style="padding: 8px; color: #666;">EPS (每股盈餘)</td>
-                <td style="padding: 8px; font-weight: bold;">{data['eps']}</td>
-                <td style="padding: 8px; color: #666;">P/E (本益比)</td>
-                <td style="padding: 8px; font-weight: bold;">{data['pe']}</td>
-                <td style="padding: 8px; color: #666;">預估下年 EPS</td>
-                <td style="padding: 8px; font-weight: bold;">{data['f_eps']}</td>
-            </tr>
-            <tr>
-                <td style="padding: 8px; color: #666;">預估 Forward P/E</td>
-                <td style="padding: 8px; font-weight: bold;">{data['f_pe']}</td>
-                <td style="padding: 8px; color: #666;">毛利率</td>
-                <td style="padding: 8px; font-weight: bold;">{data['margin']}</td>
-                <td style="padding: 8px; color: #666;">負債/權益比</td>
-                <td style="padding: 8px; font-weight: bold;">{data['debt']}</td>
-            </tr>
-        </table>
-        <div style="margin-top: 15px;">
-            <strong style="color: #333;">💼 業務說明：</strong>
-            <p style="font-size: 15px; line-height: 1.6; color: #444; text-align: justify; margin-top: 5px;">
-                {data['desc_cn']}
-            </p>
+            <div style="background-color: #fff; padding: 15px; border-radius: 8px; border: 1px solid #eee;">
+                <strong style="color: #d93025; font-size: 1.1em;">經營概述：</strong>
+                <p style="font-size: 15px; line-height: 1.8; color: #333; text-align: justify; margin-top: 8px; margin-bottom: 0;">
+                    {desc}
+                </p>
+                <div style="text-align: right; font-size: 12px; color: #888; margin-top: 10px;">
+                    資料來源：{source} (即時抓取)
+                </div>
+            </div>
         </div>
-    </div>
-    """, unsafe_allow_html=True)
+        """, unsafe_allow_html=True)
+    else:
+        st.warning(f"無法取得 {ticker} 數據")
 
 def get_stock_data_from_2009(ticker):
     try:
         start_date = "2009-01-01"
         df = yf.download(ticker, start=start_date, progress=False)
-        
-        if df.empty: return None, f"找不到 {ticker} 或該期間無資料"
-        
+        if df.empty: return None, f"無資料"
         df = df.reset_index()
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
+        if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
         df = df.loc[:, ~df.columns.duplicated()]
-        
-        if 'Close' not in df.columns: return None, "無收盤價資料"
-
+        if 'Close' not in df.columns: return None, "無收盤價"
         df['Date'] = pd.to_datetime(df['Date'])
         df['Close'] = pd.to_numeric(df['Close'], errors='coerce')
         df = df.dropna(subset=['Close'])
-
-        # 均線
         df['MA20'] = df['Close'].rolling(window=20).mean()
         df['MA60'] = df['Close'].rolling(window=60).mean()
         df['MA240'] = df['Close'].rolling(window=240).mean()
-        
         return df, None
-    except Exception as e:
-        return None, str(e)
+    except Exception as e: return None, str(e)
 
-def run_comprehensive_backtest(df, ki_pct, strike_pct, months):
-    """綜合回測邏輯"""
+def run_backtest(df, ki_pct, strike_pct, months):
     trading_days = int(months * 21)
     bt = df[['Date', 'Close']].copy()
     bt.columns = ['Start_Date', 'Start_Price']
-    
     bt['End_Date'] = bt['Start_Date'].shift(-trading_days)
     bt['Final_Price'] = bt['Start_Price'].shift(-trading_days)
-    
     indexer = pd.api.indexers.FixedForwardWindowIndexer(window_size=trading_days)
     bt['Min_Price_During'] = bt['Start_Price'].rolling(window=indexer, min_periods=1).min()
-    
     bt = bt.dropna()
-    
-    if bt.empty: return None, None
-    
     bt['KI_Level'] = bt['Start_Price'] * (ki_pct / 100)
     bt['Strike_Level'] = bt['Start_Price'] * (strike_pct / 100)
-    
     bt['Touched_KI'] = bt['Min_Price_During'] < bt['KI_Level']
     bt['Below_Strike'] = bt['Final_Price'] < bt['Strike_Level']
-    
     conditions = [
         (bt['Touched_KI'] == True) & (bt['Below_Strike'] == True),
         (bt['Touched_KI'] == True) & (bt['Below_Strike'] == False),
         (bt['Touched_KI'] == False)
     ]
-    choices = ['Loss', 'Safe', 'Safe']
-    bt['Result_Type'] = np.select(conditions, choices, default='Unknown')
-    
-    # 計算回本天數
-    loss_indices = bt[bt['Result_Type'] == 'Loss'].index
-    recovery_counts = [] 
-    stuck_count = 0
-    
-    for idx in loss_indices:
+    bt['Result_Type'] = np.select(conditions, ['Loss', 'Safe', 'Safe'], default='Unknown')
+    loss_idx = bt[bt['Result_Type'] == 'Loss'].index
+    recov_days = []
+    stuck = 0
+    for idx in loss_idx:
         row = bt.loc[idx]
-        target_price = row['Strike_Level']
-        end_date = row['End_Date']
-        future_data = df[(df['Date'] > end_date) & (df['Close'] >= target_price)]
-        
-        if not future_data.empty:
-            days_needed = (future_data.iloc[0]['Date'] - end_date).days
-            recovery_counts.append(days_needed)
-        else:
-            stuck_count += 1
-
-    # Bar圖資料
-    def calculate_bar_value(row):
-        gap = ((row['Final_Price'] - row['Strike_Level']) / row['Strike_Level']) * 100
-        return gap if row['Result_Type'] == 'Loss' else max(0, gap)
-
-    bt['Bar_Value'] = bt.apply(calculate_bar_value, axis=1)
-    bt['Color'] = np.where(bt['Result_Type'] == 'Loss', 'red', 'green')
-
-    # 統計
+        fut = df[(df['Date'] > row['End_Date']) & (df['Close'] >= row['Strike_Level'])]
+        if not fut.empty: recov_days.append((fut.iloc[0]['Date'] - row['End_Date']).days)
+        else: stuck += 1
+    avg_rec = np.mean(recov_days) if recov_days else 0
     total = len(bt)
-    safe_count = len(bt[bt['Result_Type'] == 'Safe'])
-    safety_prob = (safe_count / total) * 100
-    pos_count = len(bt[bt['Final_Price'] > bt['Start_Price']])
-    pos_prob = (pos_count / total) * 100
-    avg_recovery = np.mean(recovery_counts) if recovery_counts else 0
+    safe = (len(bt[bt['Result_Type'] == 'Safe']) / total) * 100
+    pos = (len(bt[bt['Final_Price'] > bt['Start_Price']]) / total) * 100
     
-    stats = {
-        'safety_prob': safety_prob,
-        'positive_prob': pos_prob,
-        'loss_count': len(loss_indices),
-        'avg_recovery': avg_recovery,
-        'stuck_count': stuck_count
-    }
+    # Bar Data
+    bt['Bar_Value'] = np.where(bt['Result_Type'] == 'Loss', 
+                               ((bt['Final_Price'] - bt['Strike_Level'])/bt['Strike_Level'])*100, 
+                               np.maximum(0, ((bt['Final_Price'] - bt['Strike_Level'])/bt['Strike_Level'])*100))
+    bt['Color'] = np.where(bt['Result_Type'] == 'Loss', 'red', 'green')
     
-    return bt, stats
+    return bt, {'safety': safe, 'pos': pos, 'loss_cnt': len(loss_idx), 'stuck': stuck, 'rec_days': avg_rec}
 
-def plot_integrated_chart(df, ticker, current_price, p_ko, p_ki, p_st):
-    """主圖：走勢 + 關鍵價位"""
-    plot_df = df.tail(750).copy() # 顯示近3年
+def plot_chart(df, ticker, cp, ko, ki, st_p):
+    plot_df = df.tail(750)
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=plot_df['Date'], y=plot_df['Close'], mode='lines', name='股價', line=dict(color='black', width=1.5)))
-    fig.add_trace(go.Scatter(x=plot_df['Date'], y=plot_df['MA20'], mode='lines', name='月線', line=dict(color='#3498db', width=1)))
-    fig.add_trace(go.Scatter(x=plot_df['Date'], y=plot_df['MA60'], mode='lines', name='季線', line=dict(color='#f1c40f', width=1)))
-    fig.add_trace(go.Scatter(x=plot_df['Date'], y=plot_df['MA240'], mode='lines', name='年線', line=dict(color='#9b59b6', width=1)))
-
-    # KO
-    fig.add_hline(y=p_ko, line_dash="dash", line_color="red", line_width=2)
-    fig.add_annotation(x=1, y=p_ko, xref="paper", yref="y", text=f"KO: {p_ko:.2f}", showarrow=False, xanchor="left", font=dict(color="red"))
-    # Strike
-    fig.add_hline(y=p_st, line_dash="solid", line_color="green", line_width=2)
-    fig.add_annotation(x=1, y=p_st, xref="paper", yref="y", text=f"Strike: {p_st:.2f}", showarrow=False, xanchor="left", font=dict(color="green"))
-    # KI
-    fig.add_hline(y=p_ki, line_dash="dot", line_color="orange", line_width=2)
-    fig.add_annotation(x=1, y=p_ki, xref="paper", yref="y", text=f"KI: {p_ki:.2f}", showarrow=False, xanchor="left", font=dict(color="orange"))
-
-    all_prices = [p_ko, p_ki, p_st, plot_df['Close'].max(), plot_df['Close'].min()]
-    y_min, y_max = min(all_prices)*0.9, max(all_prices)*1.05
-
-    fig.update_layout(title=f"{ticker} - 走勢與關鍵價位 (近3年)", height=450, margin=dict(r=80), xaxis_title="日期", yaxis_title="價格", yaxis_range=[y_min, y_max], hovermode="x unified", legend=dict(orientation="h", y=1.02, x=0))
+    fig.add_trace(go.Scatter(x=plot_df['Date'], y=plot_df['Close'], line=dict(color='black'), name='股價'))
+    fig.add_hline(y=ko, line_dash="dash", line_color="red")
+    fig.add_hline(y=ki, line_dash="dot", line_color="orange")
+    fig.add_hline(y=st_p, line_color="green")
+    fig.update_layout(title=f"{ticker} 走勢", height=400, margin=dict(l=20,r=20,t=40,b=20))
     return fig
 
-def plot_rolling_bar_chart(bt_data, ticker):
-    """Bar 圖：回測結果"""
-    fig = go.Figure()
-    fig.add_trace(go.Bar(x=bt_data['Start_Date'], y=bt_data['Bar_Value'], marker_color=bt_data['Color'], name='期末表現'))
-    fig.add_hline(y=0, line_width=1, line_color="black")
-    
-    fig.update_layout(title=f"{ticker} - 滾動回測損益分佈 (2009至今)", xaxis_title="進場日期", yaxis_title="期末距離 Strike (%)", height=350, margin=dict(l=20, r=20, t=40, b=20), showlegend=False, hovermode="x unified")
-    return fig
-
-# --- 4. 執行邏輯 ---
+# --- 5. 執行 ---
 
 if run_btn:
     ticker_list = [t.strip().upper() for t in tickers_input.split(',') if t.strip()]
     
-    if not ticker_list:
-        st.warning("請輸入代碼")
-    else:
-        for ticker in ticker_list:
-            st.markdown(f"### 📌 標的：{ticker}")
-
-            # ==========================================
-            # A. 顯示基本面資訊 + 中文簡介 (雙重保險版)
-            # ==========================================
-            with st.spinner(f"正在分析 {ticker} ..."):
-                # 不論成功失敗，這裡都會回傳一個字典，不會報錯
-                fund_data = get_company_fundamentals_robust(ticker)
-                display_fundamental_info(ticker, fund_data)
-            
-            # ==========================================
-            # B. 執行回測 (Yahoo Price Data 通常較少被擋)
-            # ==========================================
-            with st.spinner(f"正在計算歷史數據 (2009-Now) ..."):
-                df, err = get_stock_data_from_2009(ticker)
-            
+    for ticker in ticker_list:
+        # 1. 顯示中文簡介 (MoneyDJ/YahooTW 優先)
+        display_info_card(ticker)
+        
+        # 2. 執行回測
+        with st.spinner(f"計算 {ticker} 數據..."):
+            df, err = get_stock_data_from_2009(ticker)
             if err:
-                st.error(f"{ticker} 讀取失敗: {err}")
+                st.error(f"{ticker} 資料錯誤")
                 continue
                 
-            try:
-                current_price = float(df['Close'].iloc[-1])
-                p_ko = current_price * (ko_pct / 100)
-                p_st = current_price * (strike_pct / 100)
-                p_ki = current_price * (ki_pct / 100)
-            except:
-                st.error(f"{ticker} 價格計算錯誤")
-                continue
-
-            bt_data, stats = run_comprehensive_backtest(df, ki_pct, strike_pct, period_months)
+            cp = df['Close'].iloc[-1]
+            p_ko = cp * (ko_pct/100)
+            p_ki = cp * (ki_pct/100)
+            p_st = cp * (strike_pct/100)
             
-            if bt_data is None:
-                st.warning("資料不足")
-                continue
-
-            # ==========================================
-            # C. 四大重點指標
-            # ==========================================
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("最新股價", f"{current_price:.2f}")
-            c2.metric(f"KO ({ko_pct}%)", f"{p_ko:.2f}", help="若股價高於此，提前獲利出場")
-            c3.metric(f"KI ({ki_pct}%)", f"{p_ki:.2f}", help="若股價跌破此，保護消失", delta_color="inverse")
-            c4.metric(f"Strike ({strike_pct}%)", f"{p_st:.2f}", help="期初價格或接股成本")
-
-            # ==========================================
-            # D. 💰 潛在配息試算
-            # ==========================================
-            monthly_income = principal * (coupon_pa / 100) / 12
+            bt_data, stats = run_backtest(df, ki_pct, strike_pct, period_months)
             
-            st.markdown("#### 💰 潛在現金流試算 (Income Analysis)")
-            m1, m2 = st.columns(2)
-            m1.metric("投資本金", f"${principal:,.0f}")
-            m2.metric("預估每月配息", f"${monthly_income:,.0f}", help=f"計算公式: 本金 x {coupon_pa}% / 12")
-            st.divider()
-
-            # ==========================================
-            # E. 走勢及關鍵價位圖
-            # ==========================================
-            fig_main = plot_integrated_chart(df, ticker, current_price, p_ko, p_ki, p_st)
-            st.plotly_chart(fig_main, use_container_width=True)
-
-            # ==========================================
-            # F. 藍底解釋 (AI 解讀)
-            # ==========================================
-            loss_pct = 100 - stats['safety_prob']
-            stuck_rate = 0
-            if stats['loss_count'] > 0:
-                stuck_rate = (stats['stuck_count'] / stats['loss_count']) * 100
-            avg_days = stats['avg_recovery']
-
-            st.info(f"""
-            **📊 長週期回測報告 (2009/01/01 至今，每 {period_months} 個月一期)：**
+            # 配息試算 (精簡)
+            m_inc = principal * (coupon_pa/100) / 12
             
-            1.  **獲利潛力 (正報酬機率)**：
-                若不考慮配息，單純看股價，持有期滿後股價上漲的機率為 **{stats['positive_prob']:.1f}%**。
-                
-            2.  **安全性分析 (不被換到股票的機率)**：
-                在過去 16 年任意時間點進場，有 **{stats['safety_prob']:.1f}%** 的機率可以安全拿回本金 (未跌破 KI 或 跌破後漲回)。
-                
-            3.  **恢復力分析 (回到 Strike 的時間)**：
-                若不幸發生接股票的情況 (機率約 {loss_pct:.1f}%)，根據歷史經驗，**平均等待 {avg_days:.0f} 天** 股價即會漲回 Strike 價格。
-                *(註：在所有接股票的案例中，約有 {stuck_rate:.1f}% 的情況截至目前尚未解套)*
-            """)
-
-            # ==========================================
-            # G. 回測圖 (Bar Chart)
-            # ==========================================
-            st.subheader("📉 歷史滾動回測結果")
-            st.caption("🟩 **綠色**：安全 (拿回本金) ｜ 🟥 **紅色**：接股票 (虧損幅度)")
-            fig_bar = plot_rolling_bar_chart(bt_data, ticker)
+            c1, c2, c3 = st.columns(3)
+            c1.metric("最新股價", f"{cp:.2f}")
+            c2.metric("每月配息試算", f"${m_inc:,.0f}")
+            c3.metric("本金安全率", f"{stats['safety']:.1f}%")
+            
+            st.plotly_chart(plot_chart(df, ticker, cp, p_ko, p_ki, p_st), use_container_width=True)
+            
+            # Bar Chart
+            fig_bar = go.Figure()
+            fig_bar.add_trace(go.Bar(x=bt_data['Start_Date'], y=bt_data['Bar_Value'], marker_color=bt_data['Color']))
+            fig_bar.update_layout(title="歷史回測損益", height=300, margin=dict(l=20,r=20,t=40,b=20), showlegend=False)
             st.plotly_chart(fig_bar, use_container_width=True)
-
+            
             st.markdown("---")
-
 else:
-    st.info("👈 請在左側設定參數，按下「開始分析」。")
+    st.info("👈 請輸入參數並開始分析。")
 
-# ==========================================
-# 7. 底部警語
-# ==========================================
 st.markdown("""
 <style>
-.disclaimer-box {
-    background-color: #fff3f3;
-    border: 1px solid #e0b4b4;
-    padding: 15px;
-    border-radius: 5px;
-    color: #8a1f1f;
-    font-size: 0.9em;
-    margin-top: 30px;
-}
+.disclaimer-box { background-color: #fff3f3; border: 1px solid #e0b4b4; padding: 15px; border-radius: 5px; color: #8a1f1f; font-size: 0.9em; margin-top: 30px; }
 </style>
-<div class='disclaimer-box'>
-    <strong>⚠️ 免責聲明與投資風險預告</strong><br>
-    1. <strong>本工具僅供教學與模擬試算</strong>：本系統計算之數據、圖表與機率僅供參考，不代表任何形式之投資建議，亦不保證未來獲利。<br>
-    2. <strong>歷史不代表未來</strong>：回測數據基於 2009 年至今之歷史股價，過去的市場表現不保證未來的走勢。<br>
-    3. <strong>非保本商品</strong>：結構型商品 (ELN/FCN) 為非保本型投資，最大風險為股價下跌導致本金全數虧損 (需承接價值減損之股票)。<br>
-    4. <strong>實際條款為準</strong>：實際商品之觀察日、配息率、提前出場 (KO) 及敲入 (KI) 判定方式，請以發行機構之公開說明書及合約為準。<br>
-    5. <strong>資料來源</strong>：股價資料來源為 Yahoo Finance 公開數據，並經由 AI 自動翻譯，可能存在延遲、誤差或語意不精確，本系統不保證資料之即時性與正確性。
-</div>
+<div class='disclaimer-box'><strong>⚠️ 免責聲明</strong>：本工具僅供試算，資料來源為 MoneyDJ/Yahoo 股市 (透過 Proxy 抓取) 與 Yahoo Finance。</div>
 """, unsafe_allow_html=True)
